@@ -1,0 +1,19 @@
+## Quatra Arkansas firmware library — irrigation algorithm + JSON protocol
+## Per PRD v1.1 amendments §2 this library has no hardware dependencies.
+
+description: "Quatra Arkansas irrigation algorithm + webapp JSON (de)serialization."
+version: "1.1.0"
+url: "https://example.invalid/quatra"
+license: "Proprietary"
+
+# No hardware drivers are used, so this library is target-agnostic.
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c6
+
+dependencies:
+  idf:
+    version: ">=5.0"

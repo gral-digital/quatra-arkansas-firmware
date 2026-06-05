@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+tests/build/
+*.o
+*.a
+*.elf
+*.bin
+*.map
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# Generated previews of the Word doc
+preview-*.jpg
+preview-*.png
+*.pdf
+
+# Node toolchain for the docx generator
+node_modules/
+package-lock.json
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Internal — never publish
+notes/
+scripts/
+docs/
+PRD_*.md
+Quatra_*.docx
+package.json
+package-lock.json
