@@ -159,9 +159,10 @@ static int test_format_system_status(void)
 
     char buf[1024];
     int n = quatra_uart_format_system_status(buf, sizeof(buf), 1718000000U,
-                                             "1.1.0", false, true, 3600, r);
+                                             QUATRA_FIRMWARE_VERSION,
+                                             false, true, 3600, r);
     CHECK_TRUE(n > 0);
-    CHECK_TRUE(contains(buf, "\"firmware_version\":\"1.1.0\""));
+    CHECK_TRUE(contains(buf, "\"firmware_version\":\"" QUATRA_FIRMWARE_VERSION "\""));
     CHECK_TRUE(contains(buf, "\"active_zones\":[0,3]"));
     TEST_END();
     return 0;
