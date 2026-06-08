@@ -1,0 +1,9 @@
+# Runtime dependencies for the Quatra CM5 ⇄ webapp bridge.
+# Tested on Python 3.10+ (Raspberry Pi OS Bookworm ships 3.11).
+
+pyserial>=3.5
+requests>=2.31
+paho-mqtt>=2.0
+
+# tomllib is in the stdlib from 3.11; keep tomli as a fallback for 3.10.
+tomli>=2.0 ; python_version < "3.11"

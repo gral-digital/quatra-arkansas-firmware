@@ -1,0 +1,56 @@
+# Quatra CM5 ⇄ webapp bridge — example configuration.
+#
+# Copy to /etc/quatra/bridge.toml (or any path you pass to --config)
+# and edit the values for your deployment.
+
+[bridge]
+# Stable identifier for THIS device. Used as MQTT topic suffix,
+# X-Device-Id header in HTTP, and in log lines.
+device_id = "quatra-prototype-01"
+
+# Transport pick: "http" | "mqtt" | "stdout"
+# Use "stdout" on the bench to watch live messages from the ESP32
+# without involving any cloud service.
+transport = "stdout"
+
+# DEBUG / INFO / WARNING / ERROR
+log_level = "INFO"
+
+
+[uart]
+# Default UART pins on Raspberry CM5 mapped to /dev/ttyAMA0.
+# If you wire via USB-UART instead, change to /dev/ttyUSB0 (or similar).
+port = "/dev/ttyAMA0"
+baudrate = 115200
+bytesize = 8
+parity = "N"          # N | E | O
+stopbits = 1
+read_timeout_s = 1.0
+reconnect_delay_s = 2.0
+
+
+[http]
+# Required when transport = "http". Ignored otherwise.
+# Bridge will POST each JSON line to "{base_url}{publish_path}"
+# and poll "{base_url}{poll_path}" for inbound commands.
+base_url = "https://api.example.com/quatra"
+publish_path = "/messages"
+poll_path = "/commands"
+poll_interval_s = 2.0
+request_timeout_s = 10.0
+verify_tls = true
+# auth_token = "..."   # Bearer token, optional
+
+
+[mqtt]
+# Required when transport = "mqtt". Ignored otherwise.
+host = "broker.example.com"
+port = 8883
+use_tls = true
+# username = "..."
+# password = "..."
+client_id = "quatra-cm5-bridge-01"
+publish_topic = "quatra/device/{device_id}/up"
+subscribe_topic = "quatra/device/{device_id}/cmd"
+qos = 1
+keepalive_s = 60

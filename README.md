@@ -1,25 +1,30 @@
-# Quatra Arkansas — Firmware library
+# Quatra Arkansas — Firmware library + CM5 bridge
 
-ESP-IDF component implementing the **irrigation algorithm** and the **webapp
-JSON protocol** for the Quatra Arkansas smart-irrigation controller.
+Two deliverables for the Quatra Arkansas smart-irrigation controller:
 
-Hardware-agnostic by design: the integrator owns all hardware acquisition
-(LoRaWAN soil data, RS-485 weather station, RS-485 relay board), WiFi
-connectivity, NVS persistence and FreeRTOS task wiring. This library
-provides pure C99 functions that map sensor inputs to irrigation decisions
-and JSON payloads.
+1. **`components/quatra/`** — ESP-IDF component: pure C99 implementation of
+   the irrigation algorithm and the webapp JSON protocol. Hardware-agnostic;
+   the integrator owns sensor acquisition (LoRaWAN soil data, RS-485 weather
+   station, RS-485 relay board), NVS persistence and FreeRTOS task wiring.
+2. **`cm5-bridge/`** — Python daemon that runs on the Raspberry CM5 and
+   shuttles the firmware's JSON messages between the ESP32-S3 UART and the
+   webapp (HTTPS, MQTT, or stdout — pluggable). Ships with a systemd unit
+   and 22 unit tests.
 
 ## Documentation — start here
 
-- **[Integration guide](components/quatra/README.md)** — full reference for
-  integrators: step-by-step integration, function-by-function API reference
-  (parameters / return / notes), JSON protocol catalog with payload schemas
-  for every message, default configuration, integration responsibilities,
-  known limitations.
-- **[Reference example](examples/main.c)** — a complete, commented
+- **[ESP-IDF integration guide](components/quatra/README.md)** — full
+  reference for the firmware library: step-by-step integration,
+  function-by-function API reference, JSON protocol catalog with payload
+  schemas for every message, default configuration, integration
+  responsibilities, known limitations.
+- **[Reference firmware example](examples/main.c)** — complete commented
   integration skeleton (irrigation tick, daily ET0 task, UART RX
-  dispatcher). Copy into your project's `main/` directory and fill in the
-  hardware stubs marked `TODO`.
+  dispatcher). Copy into your project's `main/` and fill in the hardware
+  stubs marked `TODO`.
+- **[CM5 bridge guide](cm5-bridge/README.md)** — install on the CM5, pick
+  a transport, run as a systemd service. Covers HTTP / MQTT / stdout
+  configuration, extension API, troubleshooting.
 
 ## Repository layout
 
@@ -33,8 +38,15 @@ and JSON payloads.
 │       ├── include/           Public headers (5 files)
 │       └── src/               Implementations (3 files)
 ├── examples/
-│   └── main.c                 Reference integration for ESP-IDF
-└── tests/                     Host-side unit tests (no ESP-IDF needed)
+│   └── main.c                 Reference firmware integration for ESP-IDF
+├── cm5-bridge/                Raspberry CM5 ⇄ webapp bridge (Python)
+│   ├── README.md              Install / config / extension guide
+│   ├── quatra_cm5_bridge/     Package (config, uart_link, bridge, transports)
+│   ├── systemd/               Unit file + install.sh
+│   ├── tests/                 22 pytest unit tests (mock serial + transport)
+│   ├── requirements.txt
+│   └── config.example.toml
+└── tests/                     Firmware host-side unit tests (no ESP-IDF needed)
     ├── Makefile
     ├── test_et0.c             FAO-56 ET0 (incl. Bangkok reference case)
     ├── test_zone.c            State machine and stop conditions
@@ -68,18 +80,46 @@ For a full walkthrough see the
 **[Step-by-step integration](components/quatra/README.md#step-by-step-integration)**
 section of the integration guide.
 
-## Quick start — on host (Mac / Linux)
+## Quick start — CM5 bridge
+
+```sh
+# On the CM5, as root:
+cd cm5-bridge
+sudo ./systemd/install.sh
+sudo nano /etc/quatra/bridge.toml    # pick transport + credentials
+sudo systemctl enable --now quatra-cm5-bridge.service
+journalctl -u quatra-cm5-bridge -f
+```
+
+For bench testing without a CM5, run locally with the `stdout` transport
+to see live messages from the ESP32 — see
+[`cm5-bridge/README.md`](cm5-bridge/README.md#run-locally-for-bench-testing-development).
+
+## Quick start — firmware host tests (Mac / Linux)
 
 ```sh
 cd tests
 make test
 ```
 
-Builds and runs every unit test. cJSON is vendored, so no system-wide
-library install is required.
+Builds and runs every firmware unit test. cJSON is vendored, so no
+system-wide library install is required.
+
+## Quick start — CM5 bridge tests (Mac / Linux)
+
+```sh
+cd cm5-bridge
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest -v
+```
+
+22 tests covering UART framing, bridge orchestration and config loading,
+using in-memory fakes (no serial port, broker, or web service required).
 
 ## License
 
-Source code under `components/quatra/` and `tests/` (excluding `tests/vendor/`)
-is proprietary to the project owner. The vendored cJSON library carries its
-own MIT license — see `tests/vendor/cJSON.LICENSE`.
+Source code under `components/quatra/`, `cm5-bridge/` and `tests/`
+(excluding `tests/vendor/`) is proprietary to the project owner. The
+vendored cJSON library carries its own MIT license — see
+`tests/vendor/cJSON.LICENSE`.

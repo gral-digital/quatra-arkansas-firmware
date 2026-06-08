@@ -1,0 +1,25 @@
+[Unit]
+Description=Quatra CM5 bridge — ESP32 UART ⇄ webapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quatra
+Group=dialout
+WorkingDirectory=/opt/quatra-cm5-bridge
+Environment=PYTHONUNBUFFERED=1
+# Adjust the venv path to your install location.
+ExecStart=/opt/quatra-cm5-bridge/.venv/bin/python -m quatra_cm5_bridge --config /etc/quatra/bridge.toml
+Restart=on-failure
+RestartSec=5
+
+# Hardening — comment out items if they break access to /dev/ttyAMA0 on your image.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,16 @@ sdkconfig
 sdkconfig.old
 dependencies.lock
 
+# CM5 bridge — Python
+cm5-bridge/.venv/
+cm5-bridge/.pytest_cache/
+cm5-bridge/**/__pycache__/
+cm5-bridge/bridge.toml
+*.pyc
+
+# Release zips
+dist/
+
 # Generated previews of the Word doc
 preview-*.jpg
 preview-*.png
