@@ -13,54 +13,263 @@ its own main application.
 
 ## Table of contents
 
-1. [Quick start](#quick-start)
-2. [Module map](#module-map)
-3. [API reference](#api-reference)
-4. [JSON protocol catalog](#json-protocol-catalog)
-5. [Default configuration](#default-configuration)
-6. [Integration responsibilities](#integration-responsibilities)
-7. [Known limitations](#known-limitations)
-8. [Host-side unit tests](#host-side-unit-tests)
-9. [Hardware data path](#hardware-data-path)
-10. [Versioning and license](#versioning-and-license)
+1. [At a glance](#at-a-glance)
+2. [Step-by-step integration](#step-by-step-integration)
+3. [Reference integration example](#reference-integration-example)
+4. [Module map](#module-map)
+5. [API reference](#api-reference)
+   - [`quatra_et0_compute`](#quatra_et0_compute)
+   - [`quatra_et0_wind_at_2m`](#quatra_et0_wind_at_2m)
+   - [`quatra_zone_update`](#quatra_zone_update)
+   - [`quatra_zone_weighted_psi`](#quatra_zone_weighted_psi)
+   - [`quatra_zone_accumulate_et`](#quatra_zone_accumulate_et)
+   - [`quatra_uart_format_sensor_data`](#quatra_uart_format_sensor_data)
+   - [`quatra_uart_format_valve_state`](#quatra_uart_format_valve_state)
+   - [`quatra_uart_format_et_daily`](#quatra_uart_format_et_daily)
+   - [`quatra_uart_format_alarm`](#quatra_uart_format_alarm)
+   - [`quatra_uart_format_system_status`](#quatra_uart_format_system_status)
+   - [`quatra_uart_parse_command`](#quatra_uart_parse_command)
+   - [Enum-to-string helpers](#enum-to-string-helpers)
+6. [Data types](#data-types)
+7. [JSON protocol catalog](#json-protocol-catalog)
+8. [Default configuration](#default-configuration)
+9. [Integration responsibilities](#integration-responsibilities)
+10. [Known limitations](#known-limitations)
+11. [Host-side unit tests](#host-side-unit-tests)
+12. [Hardware data path](#hardware-data-path)
+13. [Versioning and license](#versioning-and-license)
 
 ---
 
-## Quick start
-
-Drop `components/quatra/` under your IDF project's `components/` directory,
-add `quatra` to your component's `REQUIRES`, and call the algorithm
-functions from your own task. Minimal per-zone tick:
+## At a glance
 
 ```c
+quatra_zone_result_t r = quatra_zone_update(
+    zone_id, psi, weights, mad_cb, etacc_mm,
+    flow_m3h, area_m2, elapsed_s, mode);
+
+if (r.valve_open) drive_relay(zone_id, true);
+else              drive_relay(zone_id, false);
+
+save_etacc_to_nvs(zone_id, r.ETacc_mm);
+
+char buf[1024];
+int n = quatra_uart_format_valve_state(
+    buf, sizeof buf, epoch_now,
+    zone_id, r.valve_open, r.reason,
+    r.D_applied_mm, r.ETacc_mm);
+if (n > 0) uart_write_bytes(YOUR_UART, buf, n);
+```
+
+The library is pure: no globals, no statics, no allocation after init.
+You can call it from multiple tasks in parallel without locks.
+
+For a full working skeleton see
+[`examples/main.c`](../../examples/main.c) and the next section.
+
+---
+
+## Step-by-step integration
+
+A typical ESP-IDF integration follows these twelve steps. The reference
+example at [`examples/main.c`](../../examples/main.c) implements every
+one of them, with `TODO` markers on the hardware functions you provide.
+
+### Step 1 — Place the component
+
+Copy `components/quatra/` into your project's `components/` directory.
+Your tree looks like:
+
+```
+my-project/
+├── CMakeLists.txt
+├── main/
+│   └── CMakeLists.txt
+└── components/
+    └── quatra/        ← this library
+```
+
+### Step 2 — Wire the build
+
+In `main/CMakeLists.txt`, add `quatra` to your component's `REQUIRES`:
+
+```cmake
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES quatra
+)
+```
+
+### Step 3 — Include the headers
+
+```c
+#include "quatra_config.h"
 #include "quatra_et0.h"
-#include "quatra_zone.h"
+#include "quatra_types.h"
 #include "quatra_uart.h"
+#include "quatra_zone.h"
+```
 
-void irrigation_tick(uint8_t zone)
-{
-    /* Inputs come from your code (LoRaWAN, RS-485, RTC, NVS, …). */
-    float psi[3]     = read_watermark_cb(zone);
-    float weights[3] = load_weights(zone);
+### Step 4 — Define the per-zone state YOU own
 
-    quatra_zone_result_t r = quatra_zone_update(
-        zone, psi, weights, mad_cb, etacc_mm,
-        flow_m3h, area_m2, elapsed_s, mode);
+The library is stateless; you keep state between ticks:
 
-    set_relay(zone, r.valve_open);
-    save_etacc_to_nvs(zone, r.ETacc_mm);
+```c
+typedef struct {
+    quatra_zone_config_t cfg;     /* kc, MAD, area, flow, weights */
+    quatra_op_mode_t     mode;
+    float                ETacc_mm;        /* persisted in NVS */
+    bool                 irrigating;
+    uint32_t             session_start_s;
+} zone_state_t;
 
-    char buf[1024];
-    int n = quatra_uart_format_valve_state(
-        buf, sizeof(buf), epoch_now,
-        zone, r.valve_open, r.reason,
-        r.D_applied_mm, r.ETacc_mm);
-    if (n > 0) uart_write_bytes(MY_UART_PORT, buf, n);
+static zone_state_t zones[QUATRA_NUM_ZONES];
+```
+
+Initialize each zone from defaults (see `quatra_config.h`) or from your
+saved configuration, and load `ETacc_mm` from NVS on boot.
+
+### Step 5 — Read inputs from hardware
+
+Once per tick, gather the inputs the library needs. The library does
+not read hardware — you do:
+
+```c
+float psi[3];
+hw_read_zone_psi(z, psi);                 /* LoRa → CM5 → ESP32 */
+
+quatra_weather_inputs_t w;
+hw_read_weather(&w);                      /* RS-485 station    */
+```
+
+### Step 6 — Call the zone update
+
+```c
+uint32_t elapsed_s = zones[z].irrigating
+                   ? (now_s - zones[z].session_start_s)
+                   : 0;
+
+quatra_zone_result_t r = quatra_zone_update(
+    z, psi, zones[z].cfg.weights,
+    zones[z].cfg.mad_cb, zones[z].ETacc_mm,
+    zones[z].cfg.flow_m3h, zones[z].cfg.area_m2,
+    elapsed_s, zones[z].mode);
+```
+
+### Step 7 — Drive the valve
+
+```c
+hw_set_relay(z, r.valve_open);
+```
+
+Update your session-tracking state to feed `elapsed_s` correctly on
+the next tick (start a timer when the valve opens, stop it when it
+closes).
+
+### Step 8 — Persist the accumulator
+
+```c
+zones[z].ETacc_mm = r.ETacc_mm;
+nvs_save_etacc(z, r.ETacc_mm);
+```
+
+### Step 9 — Emit telemetry events
+
+On valve transitions (the result's `valve_open` differs from the
+previous tick) format and send `valve_state`:
+
+```c
+char buf[256];
+int n = quatra_uart_format_valve_state(
+    buf, sizeof buf, now_s,
+    z, r.valve_open, r.reason,
+    r.D_applied_mm, r.ETacc_mm);
+if (n > 0) uart_send(buf, n);
+```
+
+On `state == QUATRA_ZONE_FAULT` send an `alarm`:
+
+```c
+char buf[256];
+int n = quatra_uart_format_alarm(
+    buf, sizeof buf, now_s,
+    "SENSOR_FAULT", (int8_t)z, -1,
+    "two or more sensors out of range");
+if (n > 0) uart_send(buf, n);
+```
+
+Push a `sensor_data` snapshot periodically (~30 s) with all zones and
+the latest weather.
+
+### Step 10 — Daily ET0 task
+
+Once a day at local midnight, compute ET0 and per-zone ETc, accumulate,
+and emit `et_daily`:
+
+```c
+float u2 = quatra_et0_wind_at_2m(w.wind_ms, h_anemometer_m);
+float ET0 = quatra_et0_compute(
+    w.temp_c, w.humidity_pct, u2,
+    w.pressure_kpa, Rs_MJm2,
+    site_latitude_rad, day_of_year);
+
+for (uint8_t z = 0; z < QUATRA_NUM_ZONES; ++z) {
+    float ETc = zones[z].cfg.kc * ET0;
+    zones[z].ETacc_mm = quatra_zone_accumulate_et(zones[z].ETacc_mm, ETc);
+    nvs_save_etacc(z, zones[z].ETacc_mm);
+}
+/* … then format and send the et_daily JSON message … */
+```
+
+`Rs_MJm2` is your integration of `lux` over the day — use
+`QUATRA_LUX_TO_WM2 = 120.0` for the per-sample conversion.
+
+### Step 11 — UART RX: parse and apply commands
+
+On every line received over UART:
+
+```c
+quatra_uart_command_t cmd;
+if (quatra_uart_parse_command(line, &cmd) == 0) {
+    switch (cmd.type) {
+        case QUATRA_CMD_SET_MODE:      /* … */ break;
+        case QUATRA_CMD_MANUAL_VALVE:  /* … */ break;
+        case QUATRA_CMD_SET_PARAMS:    /* … */ break;
+        case QUATRA_CMD_REQUEST_STATUS:/* respond with system_status */ break;
+        case QUATRA_CMD_RESET_FAULT:   /* clear your local fault latch */ break;
+        case QUATRA_CMD_RESET_ETACC:   /* zero ETacc for the zone */    break;
+        default: break;
+    }
 }
 ```
 
-The functions are pure: no globals, no statics, no allocation after init.
-You can call them from multiple tasks in parallel without locks.
+### Step 12 — Wire the tasks
+
+Create three FreeRTOS tasks:
+
+| Task                | Period         | Purpose                                      |
+| ------------------- | -------------- | -------------------------------------------- |
+| `irrigation_task`   | 1 Hz           | per-zone tick + periodic `sensor_data`       |
+| `daily_et0_task`    | once / day     | ET0 + ETc + `et_daily`                       |
+| `uart_rx_task`      | blocking RX    | parse commands and apply them                |
+
+Reasonable stack sizes: 8 KB for `irrigation_task`, 4 KB for the others.
+Priorities depend on your system; UART RX should be at least as high
+as the irrigation task so commands are not delayed.
+
+---
+
+## Reference integration example
+
+[`examples/main.c`](../../examples/main.c) implements every step above:
+configuration defaults, the 1 Hz control tick, the 30 s telemetry push,
+edge-triggered `valve_state` events, FAULT alarms, the daily ET0 task,
+and the UART RX dispatcher.
+
+It is intentionally not a turnkey project — copy it into your project's
+`main/` directory and fill in the eleven `TODO` stubs at the top (RS-485
+read, LoRa read, relay driver, RTC, NVS, UART transport).
 
 ---
 
@@ -80,137 +289,468 @@ You can call them from multiple tasks in parallel without locks.
 
 ## API reference
 
-### `quatra_et0.h` — evapotranspiration
+Every public function is documented below with parameters, return value
+and notes. Header file paths are relative to `components/quatra/include/`.
+
+---
+
+### `quatra_et0_compute`
+
+Compute daily reference evapotranspiration ET0 using the FAO-56
+Penman-Monteith equation (steps 2 → 13 of PRD §5.2). Pure math, no
+hardware.
+
+**Header:** `quatra_et0.h`
 
 ```c
-float quatra_et0_compute(
-    float T_c,           // mean daily air temperature [°C]
-    float RH_pct,        // mean daily relative humidity [%]
-    float u2_ms,         // wind speed at 2 m [m/s]
-    float P_kpa,         // mean daily atmospheric pressure [kPa]
-    float Rs_MJm2,       // daily solar radiation [MJ/m²/day]
-    float latitude_rad,  // site latitude [rad]
-    int   day_of_year);  // [1, 366]
-// → ET0 [mm/day], clamped to [0, QUATRA_ET0_MAX_MM_DAY = 20.0]
-
-float quatra_et0_wind_at_2m(float u_h_ms, float h_m);
-// Project anemometer wind from height h to FAO-56 reference 2 m
-// (log profile). Returns u_h_ms unchanged when h ≤ 0 or h == 2.
+float quatra_et0_compute(float T_c,
+                         float RH_pct,
+                         float u2_ms,
+                         float P_kpa,
+                         float Rs_MJm2,
+                         float latitude_rad,
+                         int   day_of_year);
 ```
 
-The integrator computes `Rs_MJm2` from the weather station's `lux`
-reading; the conversion constant `QUATRA_LUX_TO_WM2 = 120.0` is exposed
-in `quatra_config.h` so client code can share it.
+**Parameters**
+- `T_c` — mean daily air temperature, °C.
+- `RH_pct` — mean daily relative humidity, %.
+- `u2_ms` — wind speed at 2 m height, m/s. Use
+  [`quatra_et0_wind_at_2m`](#quatra_et0_wind_at_2m) if the anemometer is
+  not at 2 m.
+- `P_kpa` — mean daily atmospheric pressure, kPa.
+- `Rs_MJm2` — integrated daily solar radiation, MJ/m²/day. The
+  integrator derives this from the weather station's `lux` channel —
+  see `QUATRA_LUX_TO_WM2` in `quatra_config.h`.
+- `latitude_rad` — site latitude, radians (positive north).
+- `day_of_year` — day of year in `[1, 366]`.
 
-### `quatra_zone.h` — per-zone control
+**Returns**
+ET0 in mm/day, clamped to `[0, QUATRA_ET0_MAX_MM_DAY]` (20.0 by default).
+Invalid or out-of-range inputs are clamped/sanitised internally.
+
+**Notes**
+- The function is pure and re-entrant.
+- Call once per day, typically just after midnight in the same task
+  that emits the `et_daily` JSON.
+
+---
+
+### `quatra_et0_wind_at_2m`
+
+Project a wind reading from anemometer height to the FAO-56 reference
+height of 2 m, using the standard log profile.
+
+**Header:** `quatra_et0.h`
+
+```c
+float quatra_et0_wind_at_2m(float u_h_ms, float h_m);
+```
+
+**Parameters**
+- `u_h_ms` — wind speed at the anemometer mounting height, m/s.
+- `h_m` — anemometer mounting height, m.
+
+**Returns**
+Wind speed at 2 m, m/s. If `h_m == 2.0` the input is returned
+unchanged. Invalid heights (`h_m <= 0`) also return the input
+unchanged.
+
+---
+
+### `quatra_zone_update`
+
+Run one tick of the per-zone state machine. Pure function: given the
+current inputs it returns the action the integrator must take next
+(valve state, new state, updated accumulator). Implements PRD §4.2
+(states) and §5.5 (stop conditions).
+
+**Header:** `quatra_zone.h`
 
 ```c
 quatra_zone_result_t quatra_zone_update(
-    uint8_t              zone_id,    // [0, QUATRA_NUM_ZONES); diagnostics only
-    const float          psi[3],     // Watermark readings [cb], already in centibar
-    const float          weights[3], // per-depth weights, typically {1, 2, 3}
-    float                MAD_cb,     // Management Allowable Depletion [cb]
-    float                ETacc_mm,   // current accumulator [mm], integrator-persisted
-    float                Q_m3h,      // flow rate [m³/h]
-    float                area_m2,    // irrigated area [m²]
-    uint32_t             elapsed_s,  // 0 if IDLE, else seconds since irrigation start
-    quatra_op_mode_t     mode);      // MANUAL / SEMI_AUTO / FULL_AUTO
+    uint8_t              zone_id,
+    const float          psi[QUATRA_SENSORS_PER_ZONE],
+    const float          weights[QUATRA_SENSORS_PER_ZONE],
+    float                MAD_cb,
+    float                ETacc_mm,
+    float                Q_m3h,
+    float                area_m2,
+    uint32_t             elapsed_s,
+    quatra_op_mode_t     mode);
+```
 
-float quatra_zone_weighted_psi (const float psi[3], const float weights[3]);
+**Parameters**
+- `zone_id` — zone index in `[0, QUATRA_NUM_ZONES)`. Used for
+  diagnostics only.
+- `psi` — array of 3 Watermark readings, centibar, already converted
+  by the upstream adapter.
+- `weights` — per-depth weights for the average (typically `{1, 2, 3}`).
+- `MAD_cb` — Management Allowable Depletion threshold, centibar.
+- `ETacc_mm` — current accumulated ET, mm. The integrator persists this
+  across reboots and resets it at local midnight.
+- `Q_m3h` — flow rate for the zone, m³/h.
+- `area_m2` — irrigated area, m².
+- `elapsed_s` — `0` if the zone is IDLE, otherwise the number of
+  seconds elapsed since the irrigation session started.
+- `mode` — operating mode: `QUATRA_MODE_MANUAL`, `QUATRA_MODE_SEMI_AUTO`
+  or `QUATRA_MODE_FULL_AUTO`.
+
+**Returns**
+A populated `quatra_zone_result_t` (see [Data types](#data-types)).
+The integrator should:
+- Drive the relay from `r.valve_open`.
+- Persist `r.ETacc_mm` to NVS.
+- Format and send a `valve_state` JSON event when `r.valve_open` flips.
+- Format and send an `alarm` when `r.state == QUATRA_ZONE_FAULT`.
+
+**Notes**
+- In `QUATRA_MODE_MANUAL` the function returns a safe baseline
+  (`valve_open=false`, `state=IDLE`) — the integrator drives the valve
+  directly via the inbound `manual_valve` command.
+- If 2 or more sensors are out of plausibility range `[PSI_MIN_CB,
+  PSI_MAX_CB]`, the zone enters `QUATRA_ZONE_FAULT` and the valve is
+  closed. A single out-of-range sensor is silently excluded from the
+  weighted average; the zone continues operating on the two healthy
+  sensors.
+
+---
+
+### `quatra_zone_weighted_psi`
+
+Compute the weighted root-zone tension average used by
+`quatra_zone_update`. Exposed as a helper so the integrator can use the
+same value in their own telemetry.
+
+**Header:** `quatra_zone.h`
+
+```c
+float quatra_zone_weighted_psi(
+    const float psi[QUATRA_SENSORS_PER_ZONE],
+    const float weights[QUATRA_SENSORS_PER_ZONE]);
+```
+
+**Parameters**
+- `psi` — array of 3 readings, centibar.
+- `weights` — array of 3 weights. If all are zero or invalid, the
+  function falls back to an equal-weight average over the valid
+  sensors.
+
+**Returns**
+The weighted average in centibar. Out-of-range readings (NaN, negative,
+> `PSI_MAX_CB`) are excluded from the sum. If no readings are valid the
+function returns `0.0`.
+
+---
+
+### `quatra_zone_accumulate_et`
+
+Apply one daily ETc contribution to the running accumulator.
+
+**Header:** `quatra_zone.h`
+
+```c
 float quatra_zone_accumulate_et(float ETacc_mm, float ETc_mm);
 ```
 
-Calling convention for `elapsed_s`:
+**Parameters**
+- `ETacc_mm` — current accumulator value, mm.
+- `ETc_mm` — daily crop evapotranspiration, mm. `ETc = Kc * ET0`.
 
-- `elapsed_s == 0` → the zone is currently IDLE (or just transitioned in).
-- `elapsed_s  > 0` → the zone is currently IRRIGATING; `elapsed_s` is
-  the number of seconds since the irrigation started.
+**Returns**
+`ETacc_mm + max(0, ETc_mm)`. NaN / negative `ETc` is ignored. NaN /
+negative `ETacc_mm` is reset to the `ETc` contribution.
 
-In `QUATRA_MODE_MANUAL` the function returns a safe baseline
-(`valve_open=false`, `state=IDLE`); the integrator drives the valve
-directly from the `manual_valve` command.
+---
 
-### `quatra_uart.h` — JSON (de)serialization
+### `quatra_uart_format_sensor_data`
 
-All formatters return bytes written (including the trailing `'\n'`) or
-`-1` on error (truncation, NULL inputs, OOM).
+Format a `sensor_data` JSON frame: latest weather snapshot plus per-zone
+psi readings.
+
+**Header:** `quatra_uart.h`
 
 ```c
 int quatra_uart_format_sensor_data(
-        char *buf, size_t len, uint32_t ts_epoch,
-        const quatra_weather_inputs_t *w,
-        const quatra_zone_result_t results[QUATRA_NUM_ZONES]);
+    char *buf, size_t buf_len,
+    uint32_t ts_epoch,
+    const quatra_weather_inputs_t *w,
+    const quatra_zone_result_t results[QUATRA_NUM_ZONES]);
+```
 
+**Parameters**
+- `buf` / `buf_len` — destination buffer and capacity. ~1 KB is
+  sufficient for 8 zones.
+- `ts_epoch` — frame timestamp, epoch seconds. The JSON key is `"ts"`.
+- `w` — latest weather inputs (caller-filled).
+- `results` — per-zone latest result snapshots.
+
+**Returns**
+Bytes written (including the trailing `'\n'`), or `-1` on truncation /
+NULL inputs / OOM.
+
+---
+
+### `quatra_uart_format_valve_state`
+
+Format a `valve_state` JSON frame for one zone, on transition.
+
+**Header:** `quatra_uart.h`
+
+```c
 int quatra_uart_format_valve_state(
-        char *buf, size_t len, uint32_t ts_epoch,
-        uint8_t zone_id, bool open,
-        quatra_valve_reason_t reason,
-        float D_target_mm,
-        float ETacc_mm);
+    char *buf, size_t buf_len,
+    uint32_t ts_epoch,
+    uint8_t  zone_id,
+    bool     open,
+    quatra_valve_reason_t reason,
+    float    D_target_mm,
+    float    ETacc_mm);
+```
 
+**Parameters**
+- `buf` / `buf_len` — destination buffer (256 B is sufficient).
+- `ts_epoch` — frame timestamp.
+- `zone_id` — zone that transitioned, `[0, QUATRA_NUM_ZONES)`.
+- `open` — new valve state.
+- `reason` — `quatra_valve_reason_t` describing why the transition
+  happened. Stringified in the JSON.
+- `D_target_mm` — target water depth for the session, mm.
+- `ETacc_mm` — current accumulator value, mm.
+
+**Returns**
+Bytes written, or `-1` on error.
+
+---
+
+### `quatra_uart_format_et_daily`
+
+Format the once-per-day `et_daily` frame: global ET0 plus per-zone Kc,
+ETc and updated ETacc.
+
+**Header:** `quatra_uart.h`
+
+```c
 int quatra_uart_format_et_daily(
-        char *buf, size_t len, uint32_t ts_epoch,
-        float    ET0_mm,
-        uint16_t day_of_year,
-        const quatra_zone_config_t cfg[QUATRA_NUM_ZONES],
-        const float ETc_mm [QUATRA_NUM_ZONES],
-        const float ETacc_mm[QUATRA_NUM_ZONES]);
+    char *buf, size_t buf_len,
+    uint32_t ts_epoch,
+    float    ET0_mm,
+    uint16_t day_of_year,
+    const quatra_zone_config_t cfg[QUATRA_NUM_ZONES],
+    const float ETc_mm [QUATRA_NUM_ZONES],
+    const float ETacc_mm[QUATRA_NUM_ZONES]);
+```
 
+**Parameters**
+- `buf` / `buf_len` — destination buffer (~1 KB).
+- `ts_epoch` — frame timestamp.
+- `ET0_mm` — ET0 for the day, mm/day.
+- `day_of_year` — day of year `[1, 366]`.
+- `cfg` — per-zone config (only `kc` is read by the formatter, but the
+  full struct is taken for forward compatibility).
+- `ETc_mm` — per-zone daily ETc.
+- `ETacc_mm` — per-zone updated accumulator.
+
+**Returns**
+Bytes written, or `-1` on error.
+
+---
+
+### `quatra_uart_format_alarm`
+
+Format an `alarm` JSON frame.
+
+**Header:** `quatra_uart.h`
+
+```c
 int quatra_uart_format_alarm(
-        char *buf, size_t len, uint32_t ts_epoch,
-        const char *code,
-        int8_t      zone_id,    // -1 to omit from the JSON
-        int8_t      sensor_idx, // -1 to omit from the JSON
-        const char *detail);    // NULL to omit
+    char *buf, size_t buf_len,
+    uint32_t ts_epoch,
+    const char *code,
+    int8_t      zone_id,
+    int8_t      sensor_idx,
+    const char *detail);
+```
 
+**Parameters**
+- `buf` / `buf_len` — destination buffer (256 B suffices).
+- `ts_epoch` — frame timestamp.
+- `code` — short alarm code string, e.g. `"SENSOR_FAULT"`,
+  `"ET0_OUT_OF_RANGE"`. Must be non-NULL.
+- `zone_id` — affected zone, or `-1` to omit the field from the JSON.
+- `sensor_idx` — affected sensor in the zone, or `-1` to omit.
+- `detail` — free-form description, or `NULL` to omit.
+
+**Returns**
+Bytes written, or `-1` on error.
+
+---
+
+### `quatra_uart_format_system_status`
+
+Format a `system_status` JSON frame: firmware version, link state,
+uptime, list of currently-irrigating zones.
+
+**Header:** `quatra_uart.h`
+
+```c
 int quatra_uart_format_system_status(
-        char *buf, size_t len, uint32_t ts_epoch,
-        const char *firmware_version,
-        bool wifi_connected,
-        bool rtc_sync,
-        uint32_t uptime_s,
-        const quatra_zone_result_t results[QUATRA_NUM_ZONES]);
+    char *buf, size_t buf_len,
+    uint32_t ts_epoch,
+    const char *firmware_version,
+    bool wifi_connected,
+    bool rtc_sync,
+    uint32_t uptime_s,
+    const quatra_zone_result_t results[QUATRA_NUM_ZONES]);
+```
 
+**Parameters**
+- `buf` / `buf_len` — destination buffer (512 B suffices).
+- `ts_epoch` — frame timestamp.
+- `firmware_version` — version string. Pass `QUATRA_FIRMWARE_VERSION`
+  from `quatra_config.h` to stay in sync with the library.
+- `wifi_connected` — link-up boolean reported by your network stack.
+- `rtc_sync` — true when the RTC is synced with NTP.
+- `uptime_s` — seconds since boot.
+- `results` — per-zone latest result. The formatter derives the
+  `"active_zones"` list automatically from those in
+  `QUATRA_ZONE_IRRIGATING` state.
+
+**Returns**
+Bytes written, or `-1` on error.
+
+---
+
+### `quatra_uart_parse_command`
+
+Parse one inbound JSON frame into a typed `quatra_uart_command_t`.
+
+**Header:** `quatra_uart.h`
+
+```c
 int quatra_uart_parse_command(const char *json, quatra_uart_command_t *cmd_out);
-// 0 on success, -1 on malformed JSON or unknown "type".
 ```
 
-### Key struct fields (`quatra_types.h`)
+**Parameters**
+- `json` — NUL-terminated JSON frame. The caller has already stripped
+  the trailing `'\n'` (or it's safely ignored by the JSON parser).
+- `cmd_out` — populated discriminated-union command struct. Only the
+  fields relevant to `cmd_out->type` are written; everything else is
+  zero-initialised.
 
-`quatra_weather_inputs_t` — exactly what the integrator reads from the
-RS-485 weather station:
+**Returns**
+`0` on success, `-1` on malformed JSON or unknown `"type"`.
+
+**Recognised `"type"` values:** `"set_params"`, `"set_mode"`,
+`"manual_valve"`, `"request_status"`, `"reset_fault"`, `"reset_ETacc"`.
+
+---
+
+### Enum-to-string helpers
+
+Useful when you want to stringify enum values in your own logs:
 
 ```c
-float temp_c, humidity_pct, wind_ms, pressure_kpa, lux, rain_mm_min;
+const char *quatra_uart_state_str (quatra_zone_state_t s);
+const char *quatra_uart_reason_str(quatra_valve_reason_t r);
+const char *quatra_uart_mode_str  (quatra_op_mode_t m);
 ```
 
-> `Rs_MJm2` is NOT in this struct — the integrator derives it from `lux`.
-> `h_anemometer_m` is a global parameter, set via `set_params` command
-> (default `2.0`).
+All three return a pointer to a string literal — never NULL, never
+needs to be freed.
 
-`quatra_zone_config_t`:
+---
+
+## Data types
+
+### `quatra_weather_inputs_t` — `quatra_types.h`
+
+What the integrator reads from the RS-485 weather station and passes
+to the formatters and (via ET0) to the math:
 
 ```c
-float kc, mad_cb, weights[3], area_m2, flow_m3h;
+typedef struct {
+    float temp_c;          // [°C]
+    float humidity_pct;    // [%]
+    float wind_ms;         // [m/s]
+    float pressure_kpa;    // [kPa]
+    float lux;             // raw lux
+    float rain_mm_min;     // [mm/min]
+} quatra_weather_inputs_t;
 ```
 
-> There is no `t_max_runtime` field — the safety cap is the global
-> `QUATRA_MAX_RUNTIME_S` (`#define` in `quatra_config.h`).
+> `Rs_MJm2` is NOT in this struct — derive it from `lux` over the day
+> using `QUATRA_LUX_TO_WM2 = 120.0`.
+>
+> `h_anemometer_m` is NOT here either — it is a global parameter set
+> via the `set_params` command (default `QUATRA_H_ANEMOMETER = 2.0`).
 
-`quatra_zone_result_t` (returned by `zone_update`):
+### `quatra_zone_config_t` — `quatra_types.h`
 
 ```c
-bool                  valve_open;     // act on this
-float                 psi[3];         // echoed inputs
-float                 psi_avg_cb;     // weighted average
-float                 D_applied_mm;   // water applied this session
-float                 ETacc_mm;       // updated accumulator — PERSIST
-quatra_zone_state_t   state;          // IDLE / IRRIGATING / FAULT
-quatra_valve_reason_t reason;         // last transition rationale
+typedef struct {
+    float kc;                                   // crop coefficient
+    float mad_cb;                               // MAD threshold [cb]
+    float weights[QUATRA_SENSORS_PER_ZONE];     // per-depth weights
+    float area_m2;                              // irrigated area [m²]
+    float flow_m3h;                             // flow rate [m³/h]
+} quatra_zone_config_t;
 ```
 
-`quatra_uart_command_t` is a discriminated union; the `type` field
-identifies which sub-fields are populated. See the header.
+> No `t_max_runtime` field — the safety cap is the global
+> `QUATRA_MAX_RUNTIME_S = 3600` (compile-time `#define`).
+
+### `quatra_zone_result_t` — `quatra_types.h`
+
+Returned by `quatra_zone_update`:
+
+```c
+typedef struct {
+    bool                  valve_open;     // act on this
+    float                 psi[3];         // echoed inputs
+    float                 psi_avg_cb;     // weighted average
+    float                 D_applied_mm;   // water applied this session
+    float                 ETacc_mm;       // updated accumulator (persist)
+    quatra_zone_state_t   state;          // IDLE / IRRIGATING / FAULT
+    quatra_valve_reason_t reason;         // last transition rationale
+} quatra_zone_result_t;
+```
+
+### `quatra_uart_command_t` — `quatra_types.h`
+
+Discriminated union populated by `quatra_uart_parse_command`. The
+`type` field is one of `quatra_cmd_type_t`:
+
+| `type`                      | Populated fields                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------- |
+| `QUATRA_CMD_SET_MODE`       | `mode_zone_id` (int8_t, -1 = all), `mode_value`                                  |
+| `QUATRA_CMD_MANUAL_VALVE`   | `manual_zone_id`, `manual_open`                                                  |
+| `QUATRA_CMD_SET_PARAMS`     | `setp_mask`, `setp_latitude_rad`, `setp_h_anemometer_m`, `setp_zone_mask`, `setp_zones[8]` |
+| `QUATRA_CMD_REQUEST_STATUS` | (none — empty payload on the wire)                                               |
+| `QUATRA_CMD_RESET_FAULT`    | `target_zone_id`                                                                 |
+| `QUATRA_CMD_RESET_ETACC`    | `target_zone_id`                                                                 |
+
+### Enums — `quatra_types.h`
+
+```c
+typedef enum {
+    QUATRA_ZONE_IDLE = 0, QUATRA_ZONE_IRRIGATING, QUATRA_ZONE_FAULT,
+} quatra_zone_state_t;
+
+typedef enum {
+    QUATRA_MODE_MANUAL = 0, QUATRA_MODE_SEMI_AUTO, QUATRA_MODE_FULL_AUTO,
+} quatra_op_mode_t;
+
+typedef enum {
+    QUATRA_REASON_NONE = 0,
+    QUATRA_REASON_MAD_TRIGGER,
+    QUATRA_REASON_SOIL_RECOVERED,
+    QUATRA_REASON_ET_SATISFIED,
+    QUATRA_REASON_MAX_RUNTIME,
+    QUATRA_REASON_FAULT,
+    QUATRA_REASON_MANUAL_CMD,
+} quatra_valve_reason_t;
+```
 
 ---
 

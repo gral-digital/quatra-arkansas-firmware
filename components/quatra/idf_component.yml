@@ -2,7 +2,7 @@
 ## Per PRD v1.1 amendments §2 this library has no hardware dependencies.
 
 description: "Quatra Arkansas irrigation algorithm + webapp JSON (de)serialization."
-version: "1.1.1"
+version: "1.1.2"
 url: "https://github.com/gral-digital/quatra-arkansas-firmware"
 license: "Proprietary"
 
